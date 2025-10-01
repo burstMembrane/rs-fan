@@ -31,9 +31,34 @@ def main():
         "-f",
         "--formats",
         nargs="+",
-        type=List[str],
         default=["16000:1", "44100:2", "44100:1"],
-        help="Output formats (e.g., wav, flac, mp3).",
+        help="Output formats specs in rate:channel format.",
+    )
+    parser.add_argument(
+        "--output-format",
+        type=str,
+        choices=["wav", "mp3"],
+        default="wav",
+        help="Output file format.",
+    )
+    parser.add_argument(
+        "--mp3-bitrate",
+        type=int,
+        default=320,
+        help="MP3 bitrate in kbps (64, 80, 96, 112, 128, 160, 192, 224, 256, 320).",
+    )
+    parser.add_argument(
+        "--mp3-quality",
+        type=int,
+        default=2,
+        choices=range(10),
+        help="MP3 encoding quality (0=best, 9=worst).",
+    )
+    parser.add_argument(
+        "--mp3-encoding-threads",
+        type=int,
+        default=4,
+        help="Number of parallel encoding threads per MP3 file (0=auto, 1=single-threaded).",
     )
     args = parser.parse_args()
     # parse the formats
@@ -48,6 +73,10 @@ def main():
         output_dir=args.output_dir,
         quality=args.quality,
         soxr_threads=args.threads,
+        output_format=args.output_format,
+        mp3_bitrate=args.mp3_bitrate,
+        mp3_quality=args.mp3_quality,
+        mp3_encoding_threads=args.mp3_encoding_threads,
     )
     print(result)
 

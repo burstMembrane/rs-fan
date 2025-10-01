@@ -26,8 +26,10 @@ rayon = "1.11.0"
 pyo3 = { version = "0.23", features = ["extension-module"] }
 serde = { version = "1.0.214", features = ["derive"] }
 serde_json = "1.0.132"
+## further optim would be use sndfiles native mp3 encoding
 sndfile = { version = "0.1.1", default-features = false }
 soxr = "0.6.0"
+mp3lame-encoder = "0.1"
 
 [profile.release]
 opt-level = 3
@@ -38,6 +40,10 @@ strip = true
 
 [profile.release.package."*"]
 opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
 
 [profile.dev]
 opt-level = 1

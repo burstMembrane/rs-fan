@@ -19,3 +19,7 @@ rs-fan = "resamplefan.cli:main"
 [tool.maturin]
 python-source = "python"
 module-name = "resamplefan"
+
+[dependency-groups]
+dev = ["pyinstrument>=5.1.1"]
+# debug = 2

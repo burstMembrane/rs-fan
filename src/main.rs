@@ -1,11 +1,10 @@
 use anyhow::Result;
 use clap::Parser;
-use log::{info, warn, error};
-use std::path::PathBuf;
 use env_logger;
+use log::info;
+use std::path::PathBuf;
 
-use rs_fan::{parse_format_spec, FormatSpec, resample_fan};
-
+use rs_fan::{parse_format_spec, resample_fan, FormatSpec, Mp3Config, OutputFormat};
 
 #[derive(Parser)]
 #[command(name = "resamplefan")]
@@ -37,6 +36,22 @@ struct Args {
     /// Output results as JSON
     #[arg(long, action = clap::ArgAction::SetTrue)]
     json: bool,
+
+    /// Output format (wav or mp3)
+    #[arg(long, default_value = "wav", value_parser = ["wav", "mp3"])]
+    output_format: String,
+
+    /// MP3 bitrate in kbps (64, 80, 96, 112, 128, 160, 192, 224, 256, 320)
+    #[arg(long, default_value_t = 192)]
+    mp3_bitrate: u32,
+
+    /// MP3 encoding quality (0 = best, 9 = worst)
+    #[arg(long, default_value_t = 2)]
+    mp3_quality: u32,
+
+    /// Number of parallel encoding threads per MP3 file (0 = auto, 1 = single-threaded)
+    #[arg(long, default_value_t = 4)]
+    mp3_encoding_threads: usize,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -55,12 +70,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.formats.iter().map(|s| parse_format_spec(s)).collect();
     let specs = specs?;
 
+    // Parse output format
+    let output_format = match args.output_format.as_str() {
+        "wav" => OutputFormat::Wav,
+        "mp3" => OutputFormat::Mp3,
+        _ => return Err(format!("Invalid output format: {}", args.output_format).into()),
+    };
+
+    // Create MP3 config if needed
+    let mp3_config = if output_format == OutputFormat::Mp3 {
+        Some(Mp3Config {
+            bitrate: args.mp3_bitrate,
+            quality: args.mp3_quality,
+            encoding_threads: args.mp3_encoding_threads,
+        })
+    } else {
+        None
+    };
+
     if !args.json {
         info!(
             "Processing {} format(s) from: {}",
             specs.len(),
             args.input_file.display()
         );
+        if output_format == OutputFormat::Mp3 {
+            info!(
+                "Output format: MP3 ({}kbps, quality: {})",
+                args.mp3_bitrate, args.mp3_quality
+            );
+        } else {
+            info!("Output format: WAV");
+        }
     }
 
     // Call core resample_fan function
@@ -70,6 +111,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &args.output_dir,
         &args.quality,
         args.soxr_threads,
+        output_format,
+        mp3_config,
     )?;
 
     // Display results

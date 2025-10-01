@@ -17,6 +17,19 @@ use std::time::Instant;
 // Python bindings module
 pub mod python;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Wav,
+    Mp3,
+}
+
+#[derive(Debug, Clone)]
+pub struct Mp3Config {
+    pub bitrate: u32,
+    pub quality: u32, // 0-9, where 0 is best and 9 is worst
+    pub encoding_threads: usize, // Number of parallel encoding threads per file (0 = auto)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FormatSpec {
     pub sample_rate: u32,
@@ -98,7 +111,7 @@ pub fn resample_audio(
     input_channels: usize,
     output_channels: usize,
     quality: QualityRecipe,
-    threads: usize,
+    _threads: usize, // Deprecated: SOXR uses 1 thread, rayon handles parallelism
 ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     // Skip resampling if sample rates match
     if (in_sr - out_sr).abs() < 0.1 {
@@ -113,7 +126,8 @@ pub fn resample_audio(
     }
 
     let q = QualitySpec::new(quality);
-    let rt = RuntimeSpec::new(threads as u32);
+    // Use 1 thread per SOXR instance; rayon handles parallelism across tasks
+    let rt = RuntimeSpec::new(1);
 
     // Pre-allocate with better estimation
     let ratio = out_sr / in_sr;
@@ -209,11 +223,20 @@ pub fn resample_audio(
             written
         }
         (2, 2) => {
-            // Stereo to stereo: convert formats for soxr
+            // Stereo to stereo: optimized with pre-sized allocations
             let input_frames = input.len() / 2;
-            let mut input_stereo = vec![[0f32; 2]; input_frames];
-            for (i, chunk) in input.chunks_exact(2).enumerate() {
-                input_stereo[i] = [chunk[0], chunk[1]];
+
+            // Pre-allocate with exact size needed
+            let mut input_stereo = Vec::with_capacity(input_frames);
+            unsafe {
+                input_stereo.set_len(input_frames);
+            }
+
+            // Single-pass conversion using unsafe for speed
+            let input_ptr = input.as_ptr();
+            let output_ptr = input_stereo.as_mut_ptr() as *mut f32;
+            unsafe {
+                std::ptr::copy_nonoverlapping(input_ptr, output_ptr, input.len());
             }
 
             let output_frames = est_frames;
@@ -240,14 +263,17 @@ pub fn resample_audio(
                 written_frames += n;
             }
 
-            // Convert back to interleaved f32
+            // Convert back to interleaved - single pass with exact size
             let written_samples = written_frames * 2;
             if written_samples > out.len() {
                 out.resize(written_samples, 0.0);
             }
-            for (i, frame) in output_stereo.iter().take(written_frames).enumerate() {
-                out[i * 2] = frame[0];
-                out[i * 2 + 1] = frame[1];
+
+            // Fast copy using unsafe
+            let src_ptr = output_stereo.as_ptr() as *const f32;
+            let dst_ptr = out.as_mut_ptr();
+            unsafe {
+                std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, written_samples);
             }
 
             written_samples
@@ -288,6 +314,212 @@ pub fn write_audio_float(
     Ok(())
 }
 
+// Helper to encode a single chunk of audio to MP3
+fn encode_mp3_chunk(
+    data: &[f32],
+    sample_rate: u32,
+    channels: usize,
+    config: &Mp3Config,
+) -> Result<Vec<u8>, String> {
+    use mp3lame_encoder::{Builder, DualPcm, FlushNoGap, Mode};
+
+    // Fast saturating f32->i16 conversion
+    #[inline(always)]
+    fn f32_to_i16(x: f32) -> i16 {
+        let y = (x * 32767.0).clamp(-32768.0, 32767.0);
+        y as i16
+    }
+
+    // Initialize LAME encoder for this chunk
+    let mut b = Builder::new().ok_or("Failed to create LAME builder")?;
+    b.set_num_channels(2)
+        .map_err(|e| format!("Failed to set channels: {:?}", e))?;
+    b.set_sample_rate(sample_rate)
+        .map_err(|e| format!("Failed to set sample rate: {:?}", e))?;
+    b.set_mode(Mode::JointStereo)
+        .map_err(|e| format!("Failed to set mode: {:?}", e))?;
+
+    let bitrate = match config.bitrate {
+        320 => mp3lame_encoder::Bitrate::Kbps320,
+        256 => mp3lame_encoder::Bitrate::Kbps256,
+        224 => mp3lame_encoder::Bitrate::Kbps224,
+        192 => mp3lame_encoder::Bitrate::Kbps192,
+        160 => mp3lame_encoder::Bitrate::Kbps160,
+        128 => mp3lame_encoder::Bitrate::Kbps128,
+        112 => mp3lame_encoder::Bitrate::Kbps112,
+        96 => mp3lame_encoder::Bitrate::Kbps96,
+        80 => mp3lame_encoder::Bitrate::Kbps80,
+        64 => mp3lame_encoder::Bitrate::Kbps64,
+        _ => mp3lame_encoder::Bitrate::Kbps192,
+    };
+    b.set_brate(bitrate)
+        .map_err(|e| format!("Failed to set bitrate: {:?}", e))?;
+
+    let quality = match config.quality {
+        0..=2 => mp3lame_encoder::Quality::Best,
+        3..=4 => mp3lame_encoder::Quality::Good,
+        _ => mp3lame_encoder::Quality::Ok,
+    };
+    b.set_quality(quality)
+        .map_err(|e| format!("Failed to set quality: {:?}", e))?;
+
+    let mut enc = b
+        .build()
+        .map_err(|e| format!("Failed to initialize LAME encoder: {:?}", e))?;
+
+    // Encode this chunk
+    const FRAMES: usize = 1152 * 16;
+    let mut left = vec![0i16; FRAMES];
+    let mut right = vec![0i16; FRAMES];
+    let max_need = mp3lame_encoder::max_required_buffer_size(FRAMES);
+    let mut mp3_buffer = Vec::<u8>::with_capacity(max_need);
+    let mut result = Vec::new();
+
+    match channels {
+        1 => {
+            let mut cursor = 0;
+            while cursor < data.len() {
+                let take = FRAMES.min(data.len() - cursor);
+                for i in 0..take {
+                    left[i] = f32_to_i16(data[cursor + i]);
+                }
+                let pcm = DualPcm {
+                    left: &left[..take],
+                    right: &left[..take],
+                };
+                mp3_buffer.clear();
+                let n = enc
+                    .encode(pcm, mp3_buffer.spare_capacity_mut())
+                    .map_err(|e| format!("Failed to encode mono: {:?}", e))?;
+                unsafe {
+                    mp3_buffer.set_len(n);
+                }
+                result.extend_from_slice(&mp3_buffer);
+                cursor += take;
+            }
+        }
+        2 => {
+            let mut cursor = 0;
+            while cursor < data.len() {
+                let frames_avail = (data.len() - cursor) / 2;
+                if frames_avail == 0 {
+                    break;
+                }
+                let take_frames = FRAMES.min(frames_avail);
+                for i in 0..take_frames {
+                    let idx = cursor + 2 * i;
+                    left[i] = f32_to_i16(data[idx]);
+                    right[i] = f32_to_i16(data[idx + 1]);
+                }
+                let pcm = DualPcm {
+                    left: &left[..take_frames],
+                    right: &right[..take_frames],
+                };
+                mp3_buffer.clear();
+                let n = enc
+                    .encode(pcm, mp3_buffer.spare_capacity_mut())
+                    .map_err(|e| format!("Failed to encode stereo: {:?}", e))?;
+                unsafe {
+                    mp3_buffer.set_len(n);
+                }
+                result.extend_from_slice(&mp3_buffer);
+                cursor += take_frames * 2;
+            }
+        }
+        _ => return Err(format!("Unsupported channel count for MP3: {}", channels).into()),
+    }
+
+    // Flush encoder
+    mp3_buffer.clear();
+    let n = enc
+        .flush::<FlushNoGap>(mp3_buffer.spare_capacity_mut())
+        .map_err(|e| format!("Failed to flush: {:?}", e))?;
+    unsafe {
+        mp3_buffer.set_len(n);
+    }
+    result.extend_from_slice(&mp3_buffer);
+
+    Ok(result)
+}
+
+fn write_mp3(
+    data: &[f32],
+    output_path: &Path,
+    sample_rate: u32,
+    channels: usize,
+    config: &Mp3Config,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{BufWriter, Write};
+    use rayon::prelude::*;
+
+    // Determine if we should use parallel encoding
+    let use_parallel = config.encoding_threads > 1 && data.len() > sample_rate as usize * channels * 10;
+
+    if !use_parallel {
+        // Small file or single-threaded: use original streaming approach
+        let encoded = encode_mp3_chunk(data, sample_rate, channels, config)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        std::fs::write(output_path, &encoded)
+            .map_err(|e| format!("Failed to write MP3 file {}: {}", output_path.display(), e))?;
+        return Ok(());
+    }
+
+    // Large file: split into chunks and encode in parallel
+    let chunk_duration_secs = 5; // 5-second chunks
+    let chunk_size_samples = sample_rate as usize * channels * chunk_duration_secs;
+
+    // Align to frame boundaries for clean splits
+    let frame_size = 1152 * channels;
+    let chunk_size = (chunk_size_samples / frame_size) * frame_size;
+
+    let chunks: Vec<&[f32]> = data.chunks(chunk_size).collect();
+
+    debug!(
+        "Encoding {} with {} parallel threads ({} chunks of ~{}s each)",
+        output_path.display(),
+        config.encoding_threads,
+        chunks.len(),
+        chunk_duration_secs
+    );
+
+    // Encode chunks in parallel
+    let encoded_chunks: Result<Vec<Vec<u8>>, String> = chunks
+        .par_iter()
+        .map(|chunk| encode_mp3_chunk(chunk, sample_rate, channels, config))
+        .collect();
+
+    let encoded_chunks = encoded_chunks.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    // Write all chunks to file
+    let file = std::fs::File::create(output_path)
+        .map_err(|e| format!("Failed to create {}: {}", output_path.display(), e))?;
+    let mut writer = BufWriter::new(file);
+
+    for chunk in encoded_chunks {
+        writer.write_all(&chunk)?;
+    }
+    writer.flush()?;
+
+    Ok(())
+}
+
+pub fn write_audio(
+    data: &[f32],
+    output_path: &Path,
+    sample_rate: u32,
+    channels: usize,
+    format: OutputFormat,
+    mp3_config: Option<&Mp3Config>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match format {
+        OutputFormat::Wav => write_audio_float(data, output_path, sample_rate, channels),
+        OutputFormat::Mp3 => {
+            let config = mp3_config.ok_or("MP3 config required for MP3 output")?;
+            write_mp3(data, output_path, sample_rate, channels, config)
+        }
+    }
+}
+
 pub fn process_optimized_pipeline(
     data: &[f32],
     input_sr: f64,
@@ -308,52 +540,59 @@ pub fn process_optimized_pipeline(
     let mut resampled_mono = std::collections::HashMap::new();
     let mut resampled_stereo = std::collections::HashMap::new();
 
-    // If input already matches a requested format, store it directly
-    for spec in specs {
-        if spec.sample_rate == input_rate {
-            match (input_channels, spec.channels) {
-                (1, 1) => {
-                    // Input is mono, request is mono - direct copy
-                    if !resampled_mono.contains_key(&input_rate) {
-                        debug!(
-                            "Input format {}Hz mono matches request - using direct copy",
-                            input_rate
-                        );
-                        resampled_mono.insert(input_rate, data.to_vec());
-                    }
-                }
-                (2, 2) => {
-                    // Input is stereo, request is stereo - direct copy
-                    if !resampled_stereo.contains_key(&input_rate) {
-                        debug!(
-                            "Input format {}Hz stereo matches request - using direct copy",
-                            input_rate
-                        );
-                        resampled_stereo.insert(input_rate, data.to_vec());
-                    }
-                }
-                (2, 1) => {
-                    // Input is stereo, request is mono - downmix
-                    if !resampled_mono.contains_key(&input_rate) {
-                        debug!(
-                            "Input format {}Hz stereo matches mono request - using downmix",
-                            input_rate
-                        );
-                        resampled_mono.insert(input_rate, mono_in.clone());
-                    }
-                }
-                (1, 2) => {
-                    // Input is mono, request is stereo - duplicate
-                    if !resampled_stereo.contains_key(&input_rate) {
-                        debug!(
-                            "Input format {}Hz mono matches stereo request - using duplication",
-                            input_rate
-                        );
-                        resampled_stereo.insert(input_rate, duplicate_to_stereo(data));
-                    }
-                }
-                _ => {} // Unsupported channel combinations
+    // If input already matches a requested format, check if we need to store it
+    // We only clone/convert if we actually need resampling OR if we need multiple outputs
+    let needs_input_rate_mono = specs
+        .iter()
+        .any(|s| s.sample_rate == input_rate && s.channels == 1);
+    let needs_input_rate_stereo = specs
+        .iter()
+        .any(|s| s.sample_rate == input_rate && s.channels == 2);
+
+    // Store input data if needed (minimize clones)
+    if needs_input_rate_mono || needs_input_rate_stereo {
+        match (
+            input_channels,
+            needs_input_rate_mono,
+            needs_input_rate_stereo,
+        ) {
+            (1, true, false) => {
+                // Input is mono, only need mono - share original data
+                debug!(
+                    "Input format {}Hz mono matches request - sharing data",
+                    input_rate
+                );
+                resampled_mono.insert(input_rate, data.to_vec());
             }
+            (1, false, true) | (1, true, true) => {
+                // Input is mono, need stereo (or both)
+                debug!("Input format {}Hz mono, duplicating to stereo", input_rate);
+                let stereo_data = duplicate_to_stereo(data);
+                resampled_stereo.insert(input_rate, stereo_data);
+                if needs_input_rate_mono {
+                    resampled_mono.insert(input_rate, data.to_vec());
+                }
+            }
+            (2, false, true) => {
+                // Input is stereo, only need stereo - share original data
+                debug!(
+                    "Input format {}Hz stereo matches request - sharing data",
+                    input_rate
+                );
+                resampled_stereo.insert(input_rate, data.to_vec());
+            }
+            (2, true, false) => {
+                // Input is stereo, only need mono
+                debug!("Input format {}Hz stereo, downmixing to mono", input_rate);
+                resampled_mono.insert(input_rate, mono_in.clone());
+            }
+            (2, true, true) => {
+                // Input is stereo, need both
+                debug!("Input format {}Hz stereo, storing both", input_rate);
+                resampled_stereo.insert(input_rate, data.to_vec());
+                resampled_mono.insert(input_rate, mono_in.clone());
+            }
+            _ => {}
         }
     }
 
@@ -441,14 +680,14 @@ pub fn process_optimized_pipeline(
                 resampled_mono.insert(rate, data);
             }
             2 => {
-                // We resampled to stereo
-                resampled_stereo.insert(rate, data.clone());
-
-                // If we also need mono for this rate, derive it from stereo
+                // If we also need mono for this rate, derive it from stereo before moving
                 if needs_mono {
                     let mono_data = make_mono_simd(&data);
                     resampled_mono.insert(rate, mono_data);
                 }
+
+                // We resampled to stereo - move (no clone!)
+                resampled_stereo.insert(rate, data);
             }
             _ => return Err("Unexpected output channel count".into()),
         }
@@ -466,36 +705,48 @@ pub fn write_format_outputs(
     specs: &[FormatSpec],
     output_dir: &Path,
     input_stem: &str,
+    output_format: OutputFormat,
+    mp3_config: Option<&Mp3Config>,
 ) -> Vec<Result<OutputPath, String>> {
     specs
         .par_iter()
         .map(|spec| {
             let start_time = Instant::now();
 
+            let extension = match output_format {
+                OutputFormat::Wav => "wav",
+                OutputFormat::Mp3 => "mp3",
+            };
+
             let output_filename = format!(
-                "{}_{:}Hz_{}ch.wav",
-                input_stem, spec.sample_rate, spec.channels
+                "{}_{:}Hz_{}ch.{}",
+                input_stem, spec.sample_rate, spec.channels, extension
             );
             let output_path = output_dir.join(output_filename);
 
-            // Select the appropriate buffer based on channel count
-            let output_data = match spec.channels {
+            // Select the appropriate buffer based on channel count (no clone, just borrow)
+            let output_data: &[f32] = match spec.channels {
                 1 => working
                     .resampled_mono
                     .get(&spec.sample_rate)
-                    .ok_or_else(|| format!("Mono data for {}Hz not found", spec.sample_rate))?
-                    .clone(),
+                    .ok_or_else(|| format!("Mono data for {}Hz not found", spec.sample_rate))?,
                 2 => working
                     .resampled_stereo
                     .get(&spec.sample_rate)
-                    .ok_or_else(|| format!("Stereo data for {}Hz not found", spec.sample_rate))?
-                    .clone(),
+                    .ok_or_else(|| format!("Stereo data for {}Hz not found", spec.sample_rate))?,
                 _ => return Err("Unsupported channel count".into()),
             };
 
             // Write to file
-            write_audio_float(&output_data, &output_path, spec.sample_rate, spec.channels)
-                .map_err(|e| format!("Write error: {}", e))?;
+            write_audio(
+                output_data,
+                &output_path,
+                spec.sample_rate,
+                spec.channels,
+                output_format,
+                mp3_config,
+            )
+            .map_err(|e| format!("Write error: {}", e))?;
 
             let _duration = start_time.elapsed();
             debug!(
@@ -521,6 +772,8 @@ pub fn resample_fan(
     output_dir: &Path,
     quality: &str,
     soxr_threads: usize,
+    output_format: OutputFormat,
+    mp3_config: Option<Mp3Config>,
 ) -> Result<Vec<OutputPath>, Box<dyn std::error::Error>> {
     // Create output directory
     fs::create_dir_all(output_dir)
@@ -558,7 +811,14 @@ pub fn resample_fan(
     )?;
 
     // Write outputs
-    let results = write_format_outputs(&working, &formats, output_dir, input_stem);
+    let results = write_format_outputs(
+        &working,
+        &formats,
+        output_dir,
+        input_stem,
+        output_format,
+        mp3_config.as_ref(),
+    );
 
     // Collect successful outputs
     let mut output_paths = Vec::new();

@@ -1,6 +1,6 @@
 FILE="test_60s.wav"
 CMD_ONE="./target/release/rs-fan $FILE"
-CMD_TWO="./compare_ffmpeg.sh $FILE ffmpeg_output"
+CMD_TWO="./scripts/compare_ffmpeg.sh $FILE ffmpeg_output"
 CMD_THREE="rs-fan $FILE --json"
 
 

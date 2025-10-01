@@ -7,8 +7,8 @@ use sndfile::{
 };
 use soxr::format::{Mono, Stereo};
 use soxr::{
-    Soxr,
     params::{QualityRecipe, QualitySpec, RuntimeSpec},
+    Soxr,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -104,10 +104,10 @@ pub fn resample_audio(
     if (in_sr - out_sr).abs() < 0.1 {
         // Still need to handle channel conversion even if sample rate is the same
         return Ok(match (input_channels, output_channels) {
-            (1, 1) => input.to_vec(), // mono to mono
+            (1, 1) => input.to_vec(),             // mono to mono
             (1, 2) => duplicate_to_stereo(input), // mono to stereo
-            (2, 1) => make_mono_simd(input), // stereo to mono
-            (2, 2) => input.to_vec(), // stereo to stereo
+            (2, 1) => make_mono_simd(input),      // stereo to mono
+            (2, 2) => input.to_vec(),             // stereo to stereo
             _ => return Err("Unsupported channel configuration".into()),
         });
     }
@@ -127,7 +127,8 @@ pub fn resample_audio(
             // Mono to mono
             let mut soxr = Soxr::<Mono<f32>>::new_with_params(in_sr, out_sr, q, rt)
                 .map_err(|e| format!("Failed to create mono resampler: {:?}", e))?;
-            let processed = soxr.process(input, &mut out)
+            let processed = soxr
+                .process(input, &mut out)
                 .map_err(|e| format!("Failed to process mono audio: {:?}", e))?;
 
             // Drain the mono resampler
@@ -136,9 +137,12 @@ pub fn resample_audio(
                 if written == out.len() {
                     out.resize(out.len() * 3 / 2, 0.0);
                 }
-                let n = soxr.drain(&mut out[written..])
+                let n = soxr
+                    .drain(&mut out[written..])
                     .map_err(|e| format!("Failed to drain mono resampler: {:?}", e))?;
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 written += n;
             }
             written
@@ -148,7 +152,8 @@ pub fn resample_audio(
             let mut mono_out = vec![0f32; est_frames];
             let mut soxr = Soxr::<Mono<f32>>::new_with_params(in_sr, out_sr, q, rt)
                 .map_err(|e| format!("Failed to create mono resampler: {:?}", e))?;
-            let processed = soxr.process(input, &mut mono_out)
+            let processed = soxr
+                .process(input, &mut mono_out)
                 .map_err(|e| format!("Failed to process mono audio: {:?}", e))?;
             let mono_len = processed.output_frames;
 
@@ -158,9 +163,12 @@ pub fn resample_audio(
                 if mono_written == mono_out.len() {
                     mono_out.resize(mono_out.len() * 3 / 2, 0.0);
                 }
-                let n = soxr.drain(&mut mono_out[mono_written..])
+                let n = soxr
+                    .drain(&mut mono_out[mono_written..])
                     .map_err(|e| format!("Failed to drain mono resampler: {:?}", e))?;
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 mono_written += n;
             }
             mono_out.truncate(mono_written);
@@ -180,7 +188,8 @@ pub fn resample_audio(
             let mono_input = make_mono_simd(input);
             let mut soxr = Soxr::<Mono<f32>>::new_with_params(in_sr, out_sr, q, rt)
                 .map_err(|e| format!("Failed to create mono resampler: {:?}", e))?;
-            let processed = soxr.process(&mono_input, &mut out)
+            let processed = soxr
+                .process(&mono_input, &mut out)
                 .map_err(|e| format!("Failed to process mono audio: {:?}", e))?;
             let mut written = processed.output_frames;
 
@@ -189,9 +198,12 @@ pub fn resample_audio(
                 if written == out.len() {
                     out.resize(out.len() * 3 / 2, 0.0);
                 }
-                let n = soxr.drain(&mut out[written..])
+                let n = soxr
+                    .drain(&mut out[written..])
                     .map_err(|e| format!("Failed to drain mono resampler: {:?}", e))?;
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 written += n;
             }
             written
@@ -209,7 +221,8 @@ pub fn resample_audio(
 
             let mut soxr = Soxr::<Stereo<f32>>::new_with_params(in_sr, out_sr, q, rt)
                 .map_err(|e| format!("Failed to create stereo resampler: {:?}", e))?;
-            let processed = soxr.process(&input_stereo, &mut output_stereo)
+            let processed = soxr
+                .process(&input_stereo, &mut output_stereo)
                 .map_err(|e| format!("Failed to process stereo audio: {:?}", e))?;
             let mut written_frames = processed.output_frames;
 
@@ -218,9 +231,12 @@ pub fn resample_audio(
                 if written_frames == output_stereo.len() {
                     output_stereo.resize(output_stereo.len() * 3 / 2, [0f32; 2]);
                 }
-                let n = soxr.drain(&mut output_stereo[written_frames..])
+                let n = soxr
+                    .drain(&mut output_stereo[written_frames..])
                     .map_err(|e| format!("Failed to drain stereo resampler: {:?}", e))?;
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 written_frames += n;
             }
 
@@ -299,28 +315,40 @@ pub fn process_optimized_pipeline(
                 (1, 1) => {
                     // Input is mono, request is mono - direct copy
                     if !resampled_mono.contains_key(&input_rate) {
-                        debug!("Input format {}Hz mono matches request - using direct copy", input_rate);
+                        debug!(
+                            "Input format {}Hz mono matches request - using direct copy",
+                            input_rate
+                        );
                         resampled_mono.insert(input_rate, data.to_vec());
                     }
                 }
                 (2, 2) => {
                     // Input is stereo, request is stereo - direct copy
                     if !resampled_stereo.contains_key(&input_rate) {
-                        debug!("Input format {}Hz stereo matches request - using direct copy", input_rate);
+                        debug!(
+                            "Input format {}Hz stereo matches request - using direct copy",
+                            input_rate
+                        );
                         resampled_stereo.insert(input_rate, data.to_vec());
                     }
                 }
                 (2, 1) => {
                     // Input is stereo, request is mono - downmix
                     if !resampled_mono.contains_key(&input_rate) {
-                        debug!("Input format {}Hz stereo matches mono request - using downmix", input_rate);
+                        debug!(
+                            "Input format {}Hz stereo matches mono request - using downmix",
+                            input_rate
+                        );
                         resampled_mono.insert(input_rate, mono_in.clone());
                     }
                 }
                 (1, 2) => {
                     // Input is mono, request is stereo - duplicate
                     if !resampled_stereo.contains_key(&input_rate) {
-                        debug!("Input format {}Hz mono matches stereo request - using duplication", input_rate);
+                        debug!(
+                            "Input format {}Hz mono matches stereo request - using duplication",
+                            input_rate
+                        );
                         resampled_stereo.insert(input_rate, duplicate_to_stereo(data));
                     }
                 }
@@ -330,7 +358,8 @@ pub fn process_optimized_pipeline(
     }
 
     // Step 3: Analyze remaining specs that need resampling
-    let mut rate_channel_needs: std::collections::HashMap<u32, (bool, bool)> = std::collections::HashMap::new();
+    let mut rate_channel_needs: std::collections::HashMap<u32, (bool, bool)> =
+        std::collections::HashMap::new();
     for spec in specs {
         // Skip if this exact format is already handled
         if spec.sample_rate == input_rate {
@@ -341,10 +370,12 @@ pub fn process_optimized_pipeline(
             }
         }
 
-        let entry = rate_channel_needs.entry(spec.sample_rate).or_insert((false, false));
+        let entry = rate_channel_needs
+            .entry(spec.sample_rate)
+            .or_insert((false, false));
         match spec.channels {
-            1 => entry.0 = true,  // needs mono
-            2 => entry.1 = true,  // needs stereo
+            1 => entry.0 = true, // needs mono
+            2 => entry.1 = true, // needs stereo
             _ => return Err("Unsupported channel count".into()),
         }
     }
@@ -366,7 +397,7 @@ pub fn process_optimized_pipeline(
                 (true, true) => (input_channels, 2), // Resample to stereo, derive mono
                 (true, false) => (input_channels, 1), // Resample to mono only
                 (false, true) => (input_channels, 2), // Resample to stereo only
-                (false, false) => unreachable!(), // Should never happen
+                (false, false) => unreachable!(),    // Should never happen
             };
             (rate, input_ch, output_ch)
         })
@@ -449,16 +480,16 @@ pub fn write_format_outputs(
 
             // Select the appropriate buffer based on channel count
             let output_data = match spec.channels {
-                1 => {
-                    working.resampled_mono.get(&spec.sample_rate)
-                        .ok_or_else(|| format!("Mono data for {}Hz not found", spec.sample_rate))?
-                        .clone()
-                }
-                2 => {
-                    working.resampled_stereo.get(&spec.sample_rate)
-                        .ok_or_else(|| format!("Stereo data for {}Hz not found", spec.sample_rate))?
-                        .clone()
-                }
+                1 => working
+                    .resampled_mono
+                    .get(&spec.sample_rate)
+                    .ok_or_else(|| format!("Mono data for {}Hz not found", spec.sample_rate))?
+                    .clone(),
+                2 => working
+                    .resampled_stereo
+                    .get(&spec.sample_rate)
+                    .ok_or_else(|| format!("Stereo data for {}Hz not found", spec.sample_rate))?
+                    .clone(),
                 _ => return Err("Unsupported channel count".into()),
             };
 
@@ -467,9 +498,13 @@ pub fn write_format_outputs(
                 .map_err(|e| format!("Write error: {}", e))?;
 
             let _duration = start_time.elapsed();
-            debug!("Created file: {} ({}Hz {}ch) in {:.2}ms",
-                   output_path.display(), spec.sample_rate, spec.channels,
-                   _duration.as_secs_f64() * 1000.0);
+            debug!(
+                "Created file: {} ({}Hz {}ch) in {:.2}ms",
+                output_path.display(),
+                spec.sample_rate,
+                spec.channels,
+                _duration.as_secs_f64() * 1000.0
+            );
 
             Ok(OutputPath {
                 path: output_path,

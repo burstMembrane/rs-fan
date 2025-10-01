@@ -1,0 +1,1 @@
+CMD="./target/release/rs-fan test_60s.wav"

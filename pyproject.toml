@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "resamplefan"
-version = "0.1.0"
+version = "0.2.0"
 description = "Fast audio resampling using SoXR"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -21,7 +21,5 @@ python-source = "python"
 module-name = "resamplefan"
 
 [dependency-groups]
-dev = [
-    "pyinstrument>=5.1.1",
-]
+dev = ["pyinstrument>=5.1.1"]
 # debug = 2

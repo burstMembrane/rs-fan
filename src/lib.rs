@@ -322,12 +322,42 @@ fn encode_mp3_chunk(
     config: &Mp3Config,
 ) -> Result<Vec<u8>, String> {
     use mp3lame_encoder::{Builder, DualPcm, FlushNoGap, Mode};
+    use wide::f32x8;
 
-    // Fast saturating f32->i16 conversion
+    // Fast saturating f32->i16 conversion (scalar fallback)
     #[inline(always)]
     fn f32_to_i16(x: f32) -> i16 {
         let y = (x * 32767.0).clamp(-32768.0, 32767.0);
         y as i16
+    }
+
+    // Vectorized f32->i16 conversion using SIMD (processes 8 samples at once)
+    #[inline(always)]
+    fn f32x8_to_i16x8(samples: &[f32]) -> [i16; 8] {
+        let scale = f32x8::splat(32767.0);
+        let min_val = f32x8::splat(-32768.0);
+        let max_val = f32x8::splat(32767.0);
+
+        // Convert slice to array
+        let arr: [f32; 8] = [
+            samples[0], samples[1], samples[2], samples[3],
+            samples[4], samples[5], samples[6], samples[7],
+        ];
+
+        let vec = f32x8::new(arr);
+        let scaled = vec * scale;
+        let clamped = scaled.max(min_val).min(max_val);
+
+        [
+            clamped.as_array_ref()[0] as i16,
+            clamped.as_array_ref()[1] as i16,
+            clamped.as_array_ref()[2] as i16,
+            clamped.as_array_ref()[3] as i16,
+            clamped.as_array_ref()[4] as i16,
+            clamped.as_array_ref()[5] as i16,
+            clamped.as_array_ref()[6] as i16,
+            clamped.as_array_ref()[7] as i16,
+        ]
     }
 
     // Initialize LAME encoder for this chunk
@@ -380,9 +410,21 @@ fn encode_mp3_chunk(
             let mut cursor = 0;
             while cursor < data.len() {
                 let take = FRAMES.min(data.len() - cursor);
-                for i in 0..take {
-                    left[i] = f32_to_i16(data[cursor + i]);
+
+                // Vectorized conversion: process 8 samples at a time
+                let mut i = 0;
+                while i + 8 <= take {
+                    let converted = f32x8_to_i16x8(&data[cursor + i..cursor + i + 8]);
+                    left[i..i + 8].copy_from_slice(&converted);
+                    i += 8;
                 }
+
+                // Handle remaining samples with scalar conversion
+                while i < take {
+                    left[i] = f32_to_i16(data[cursor + i]);
+                    i += 1;
+                }
+
                 let pcm = DualPcm {
                     left: &left[..take],
                     right: &left[..take],
@@ -406,11 +448,36 @@ fn encode_mp3_chunk(
                     break;
                 }
                 let take_frames = FRAMES.min(frames_avail);
-                for i in 0..take_frames {
+
+                // Vectorized stereo conversion with de-interleaving
+                let mut i = 0;
+                while i + 4 <= take_frames {
+                    let idx = cursor + 2 * i;
+                    // Process 4 stereo frames (8 samples) at a time
+                    if idx + 8 <= data.len() {
+                        let samples = f32x8_to_i16x8(&data[idx..idx + 8]);
+                        left[i] = samples[0];
+                        right[i] = samples[1];
+                        left[i + 1] = samples[2];
+                        right[i + 1] = samples[3];
+                        left[i + 2] = samples[4];
+                        right[i + 2] = samples[5];
+                        left[i + 3] = samples[6];
+                        right[i + 3] = samples[7];
+                        i += 4;
+                    } else {
+                        break;
+                    }
+                }
+
+                // Handle remaining frames with scalar conversion
+                while i < take_frames {
                     let idx = cursor + 2 * i;
                     left[i] = f32_to_i16(data[idx]);
                     right[i] = f32_to_i16(data[idx + 1]);
+                    i += 1;
                 }
+
                 let pcm = DualPcm {
                     left: &left[..take_frames],
                     right: &right[..take_frames],
@@ -830,4 +897,58 @@ pub fn resample_fan(
     }
 
     Ok(output_paths)
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchResult {
+    pub input_file: PathBuf,
+    pub outputs: Vec<OutputPath>,
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+/// Batch process multiple audio files in parallel
+pub fn resample_fan_batch(
+    input_files: &[PathBuf],
+    formats: Vec<FormatSpec>,
+    output_dir: &Path,
+    quality: &str,
+    soxr_threads: usize,
+    output_format: OutputFormat,
+    mp3_config: Option<Mp3Config>,
+) -> Result<Vec<BatchResult>, Box<dyn std::error::Error>> {
+    // Create output directory once
+    fs::create_dir_all(output_dir)
+        .map_err(|e| format!("Failed to create output directory: {e}"))?;
+
+    // Process all files in parallel
+    let results: Vec<BatchResult> = input_files
+        .par_iter()
+        .map(|input_file| {
+            match resample_fan(
+                input_file,
+                formats.clone(),
+                output_dir,
+                quality,
+                soxr_threads,
+                output_format,
+                mp3_config.clone(),
+            ) {
+                Ok(outputs) => BatchResult {
+                    input_file: input_file.clone(),
+                    outputs,
+                    success: true,
+                    error: None,
+                },
+                Err(e) => BatchResult {
+                    input_file: input_file.clone(),
+                    outputs: Vec::new(),
+                    success: false,
+                    error: Some(e.to_string()),
+                },
+            }
+        })
+        .collect();
+
+    Ok(results)
 }

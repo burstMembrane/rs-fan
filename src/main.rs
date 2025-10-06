@@ -1,3 +1,11 @@
+// Use jemalloc as the global allocator for better parallel performance (binary only)
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 use anyhow::Result;
 use clap::Parser;
 use env_logger;
@@ -10,8 +18,8 @@ use rs_fan::{parse_format_spec, resample_fan, FormatSpec, Mp3Config, OutputForma
 #[command(name = "resamplefan")]
 #[command(about = "A fast audio resampler using soxr")]
 struct Args {
-    /// Path to the input audio file
-    input_file: PathBuf,
+    /// Path(s) to the input audio file(s). Can specify multiple files or use glob patterns.
+    input_files: Vec<PathBuf>,
 
     /// List of audio formats to process in RATE:CHANNELS format
     #[arg(long, value_delimiter = ',', default_values_t = vec![
@@ -52,6 +60,10 @@ struct Args {
     /// Number of parallel encoding threads per MP3 file (0 = auto, 1 = single-threaded)
     #[arg(long, default_value_t = 4)]
     mp3_encoding_threads: usize,
+
+    /// Number of parallel jobs for processing multiple files (0 = use all CPU cores)
+    #[arg(long, short = 'j', default_value_t = 0)]
+    jobs: usize,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -59,11 +71,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     env_logger::init();
 
-    // Initialize rayon thread pool to avoid oversubscription
+    // Initialize rayon thread pool with configurable parallelism
+    let num_threads = if args.jobs == 0 {
+        num_cpus::get() // Use all available CPU cores
+    } else {
+        args.jobs
+    };
+
     rayon::ThreadPoolBuilder::new()
-        .num_threads(std::cmp::min(4, num_cpus::get()))
+        .num_threads(num_threads)
         .build_global()
         .ok();
+
+    if !args.json {
+        info!("Using {} parallel job(s)", num_threads);
+    }
+
+    // Validate input files
+    if args.input_files.is_empty() {
+        return Err("No input files specified".into());
+    }
 
     // Parse format specifications
     let specs: Result<Vec<FormatSpec>, _> =
@@ -90,9 +117,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if !args.json {
         info!(
-            "Processing {} format(s) from: {}",
-            specs.len(),
-            args.input_file.display()
+            "Processing {} file(s) with {} format(s) each",
+            args.input_files.len(),
+            specs.len()
         );
         if output_format == OutputFormat::Mp3 {
             info!(
@@ -104,24 +131,65 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Call core resample_fan function
-    let output_paths = resample_fan(
-        &args.input_file,
-        specs.clone(),
-        &args.output_dir,
-        &args.quality,
-        args.soxr_threads,
-        output_format,
-        mp3_config,
-    )?;
+    // Process all files in parallel using rayon
+    use rayon::prelude::*;
+    use rs_fan::BatchResult;
+
+    let all_results: Vec<BatchResult> = args
+        .input_files
+        .par_iter()
+        .map(|input_file| {
+            if !args.json {
+                info!("Processing: {}", input_file.display());
+            }
+
+            match resample_fan(
+                input_file,
+                specs.clone(),
+                &args.output_dir,
+                &args.quality,
+                args.soxr_threads,
+                output_format,
+                mp3_config.clone(),
+            ) {
+                Ok(outputs) => BatchResult {
+                    input_file: input_file.clone(),
+                    outputs,
+                    success: true,
+                    error: None,
+                },
+                Err(e) => BatchResult {
+                    input_file: input_file.clone(),
+                    outputs: Vec::new(),
+                    success: false,
+                    error: Some(e.to_string()),
+                },
+            }
+        })
+        .collect();
+
+    // Collect all output paths and handle errors
+    let mut all_output_paths = Vec::new();
+    let mut errors = Vec::new();
+
+    for result in all_results {
+        if result.success {
+            all_output_paths.extend(result.outputs);
+        } else {
+            errors.push((
+                result.input_file,
+                result.error.unwrap_or_else(|| "Unknown error".to_string()),
+            ));
+        }
+    }
 
     // Display results
     if args.json {
-        let json_output = serde_json::to_string_pretty(&output_paths)
+        let json_output = serde_json::to_string_pretty(&all_output_paths)
             .map_err(|e| format!("Failed to serialize JSON: {}", e))?;
         println!("{}", json_output);
     } else {
-        for output_path in &output_paths {
+        for output_path in &all_output_paths {
             info!(
                 " Created: {} | {}Hz {}ch",
                 output_path.path.display(),
@@ -130,10 +198,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         info!(
-            "\n Completed: {}/{} files processed successfully",
-            output_paths.len(),
-            specs.len()
+            "\n Completed: {} output files from {} input file(s)",
+            all_output_paths.len(),
+            args.input_files.len()
         );
+
+        if !errors.is_empty() {
+            info!("\n Errors encountered:");
+            for (file, error) in &errors {
+                info!("  {}: {}", file.display(), error);
+            }
+            return Err(format!("{} file(s) failed to process", errors.len()).into());
+        }
     }
 
     Ok(())

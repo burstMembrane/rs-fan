@@ -304,10 +304,7 @@ fn resample_fan_batch(
         mp3_config,
     )
     .map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Batch resampling failed: {}",
-            e
-        ))
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Batch resampling failed: {}", e))
     })?;
 
     // Serialize to JSON
@@ -349,7 +346,7 @@ fn set_num_threads(num_threads: usize) -> PyResult<()> {
 
 /// A Python module for fast audio resampling using SoXR
 #[pymodule]
-fn resamplefan(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _resamplefan(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(resample_fan, m)?)?;
     m.add_function(wrap_pyfunction!(resample_fan_batch, m)?)?;
     m.add_function(wrap_pyfunction!(set_num_threads, m)?)?;

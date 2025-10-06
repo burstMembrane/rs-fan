@@ -1,5 +1,5 @@
-from typing import List
 from pathlib import Path
+
 from resamplefan import resample_fan, resample_fan_batch, set_num_threads
 
 
@@ -73,7 +73,11 @@ def main():
     args = parser.parse_args()
     if not all(paths := [Path(arg).exists() for arg in args.input_files]):
         parser.error("One or more input files do not exist.")
-        print(", ".join(str(p) for p, exists in zip(args.input_files, paths) if not exists))
+        print(
+            ", ".join(
+                str(p) for p, exists in zip(args.input_files, paths) if not exists
+            )
+        )
 
     # Set number of threads for parallel processing
     if args.jobs != 0 or len(args.input_files) > 1:
